@@ -4,6 +4,8 @@ local helper = require("lsp_signature.helper")
 local match_parameter = helper.match_parameter
 -- local check_closer_char = helper.check_closer_char
 
+M.alpha = .75
+M.blend_color = "#000000"
 local status_line = { hint = "", label = "" }
 local manager = {
   insertChar = false, -- flag for InsertCharPre event, turn off imediately when performing completion
@@ -75,7 +77,53 @@ function manager.init()
   manager.confirmedCompletion = false
 end
 
-local function virtual_hint(hint, off_y)
+M.hl_map = {}
+local results = {}
+local hex_to_rgb = function(hex_str)
+  local hex = "[abcdef0-9][abcdef0-9]"
+  local pat = "^#(" .. hex .. ")(" .. hex .. ")(" .. hex .. ")$"
+  hex_str = string.lower(hex_str)
+  assert(string.find(hex_str, pat) ~= nil, "hex_to_rgb: invalid hex_str: " .. tostring(hex_str))
+  local red, green, blue = string.match(hex_str, pat)
+  return { tonumber(red, 16), tonumber(green, 16), tonumber(blue, 16) }
+end
+
+local blend = function(fg, bg, alpha)
+  bg = hex_to_rgb(bg)
+  fg = hex_to_rgb(fg)
+  local blendChannel = function(i)
+    local ret = (alpha * fg[i] + ((1 - alpha) * bg[i]))
+    return math.floor(math.min(math.max(0, ret), 255) + 0.5)
+  end
+  return string.format("#%02X%02X%02X", blendChannel(1), blendChannel(2), blendChannel(3))
+end
+
+local darken = function(hex, amount, bg)
+  return blend(hex, bg, math.abs(amount))
+end
+
+M.get_unused_group = function(ts_group)
+  local darkened = function(color)
+    if not results[color] then
+      results[color] = darken(color, M.alpha, M.blend_color)
+    end
+    return results[color]
+  end
+  local unused_group = string.format("%sSig", ts_group)
+  if M.hl_map[unused_group] then
+    return unused_group
+  end
+  local hl = vim.api.nvim_get_hl_by_name(ts_group, true)
+  local color = string.format("#%x", hl["foreground"] or 0)
+  if #color ~= 7 then
+    color = "#ffffff"
+  end
+  M.hl_map[unused_group] = { fg = darkened(color), undercurl = false, underline = false }
+  vim.api.nvim_set_hl(0, unused_group, M.hl_map[unused_group])
+  return unused_group
+end
+
+local function virtual_hint(hint, label, off_y)
   if hint == nil or hint == "" then
     return
   end
@@ -139,17 +187,59 @@ local function virtual_hint(hint, off_y)
 
   helper.cleanup(false) -- cleanup extmark
 
-  local vt = { pad .. _LSP_SIG_CFG.hint_prefix .. hint, _LSP_SIG_CFG.hint_scheme }
+  local vt = {}
+  local replaced = helper.replace_special(hint)
+  local active_loc = string.find(label, replaced)
+  local insert_prefix = function ()
+    local prefix = {}
+    -- local space_pos = label:find('%s')
+    -- local type_string = label:sub(1, space_pos-1)
+    -- table.insert(vt, {type_string, M.get_unused_group('@keyword.' .. type_string)})
+    -- table.insert(vt, {': ', M.get_unused_group('@punctuation')})
+    -- local name_end = label:find('%(')-1
+    -- local name = label:sub(space_pos+1, name_end)
+    -- table.insert(vt, {name, M.get_unused_group('@' .. type_string)})
+    table.insert(vt, {'@(', M.get_unused_group('@String')})
+    local params = vim.fn.split(label, '(')[2]
+    local params_active_loc = active_loc - (label:len() - params:len())
+    table.insert(vt, { params:sub(0, params_active_loc-1), M.get_unused_group('@Comment')})
+  end
+  local insert_active = function ()
+    local active = { hint, M.get_unused_group('@String' )}
+    table.insert(vt, active)
+  end
+  local insert_suffix = function ()
+    local suffix_start = active_loc + string.len(replaced)
+    local suffix = { label:sub(suffix_start, -2), M.get_unused_group('@Comment' )}
+    table.insert(vt, suffix)
+    table.insert(vt, {')', M.get_unused_group('@String')})
+  end
+  -- local prefix = get_prefix()
+  -- local suffix = get_suffix()
+  -- local prefix_end =  active_loc-1
+  -- local prefix = { label:sub(1, prefix_end - 1), 'String' }
+  local active = { hint, M.get_unused_group('@parameter' )}
+  insert_prefix()
+  insert_active()
+  insert_suffix()
+  -- local vt = { prefix, active, suffix }
+
+  -- local vt = { pad .. _LSP_SIG_CFG.hint_prefix .. hint, _LSP_SIG_CFG.hint_scheme }
 
   log("virtual text: ", cur_line, show_at, vt)
   if r ~= nil then
     vim.api.nvim_buf_set_extmark(0, _LSP_SIG_VT_NS, show_at, 0, {
-      virt_text = { vt },
+      virt_text = vt,
       virt_text_pos = "eol",
       hl_mode = "combine",
       -- hl_group = _LSP_SIG_CFG.hint_scheme
     })
   end
+end
+
+M.show_vtext = function()
+  virtual_hint(status_line.hint, status_line.label, 0)
+  return { hint = status_line.hint, label = status_line.label, range = status_line.range, doc = status_line.doc }
 end
 
 local close_events = { "CursorMoved", "CursorMovedI", "BufHidden", "InsertCharPre" }
@@ -282,7 +372,8 @@ local signature_handler = function(err, result, ctx, config)
   end
 
   if _LSP_SIG_CFG.hint_enable == true then
-    virtual_hint(hint, 0)
+    M.show_vtext()
+    -- virtual_hint(hint, 0)
   else
     _LSP_SIG_VT_NS = _LSP_SIG_VT_NS or vim.api.nvim_create_namespace("lsp_signature_vt")
 
@@ -913,19 +1004,7 @@ M.check_signature_should_close = function()
 end
 
 M.status_line = function(size)
-  size = size or 300
-  if #status_line.label + #status_line.hint > size then
-    local labelsize = size - #status_line.hint
-    -- local hintsize = #status_line.hint
-    if labelsize < 10 then
-      labelsize = 10
-    end
-    return {
-      hint = status_line.hint,
-      label = status_line.label:sub(1, labelsize) .. [[]],
-      range = status_line.range,
-    }
-  end
+  virtual_hint(status_line.hint, status_line.label, 0)
   return { hint = status_line.hint, label = status_line.label, range = status_line.range, doc = status_line.doc }
 end
 
